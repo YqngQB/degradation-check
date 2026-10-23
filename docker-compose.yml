@@ -1,0 +1,16 @@
+services:
+  degradation-check:
+    # 用官方镜像，或者把 image 换成你自己构建的 tag
+    image: ghcr.io/jaychou778/degradation-check:latest
+    build: .
+    container_name: degradation-check
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    volumes:
+      # 测试结果存在这里（SQLite 单文件），备份就是拷这个目录
+      - ./data:/data
+    environment:
+      - TZ=Asia/Shanghai
+      # 页面右上角显示的实例名，随便改
+      - INSTANCE_NAME=降智检测
