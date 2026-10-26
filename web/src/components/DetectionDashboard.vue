@@ -542,4 +542,3 @@ onBeforeUnmount(() => {
     <ServiceInfo v-if="showSettings" :mode="serviceMode" @close="showSettings = false" />
   </div>
 </template>
-
