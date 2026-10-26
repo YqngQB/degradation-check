@@ -36,6 +36,24 @@ type Store struct {
 	db *sql.DB
 }
 
+// Account IDs/results are meaningful only within one Sub2API installation.
+func (s *Store) bindInstance(base string) error {
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS instance_binding (id INTEGER PRIMARY KEY CHECK(id=1), base TEXT NOT NULL)`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO instance_binding (id,base) VALUES (1,?)`, base); err != nil {
+		return err
+	}
+	var bound string
+	if err := s.db.QueryRow(`SELECT base FROM instance_binding WHERE id=1`).Scan(&bound); err != nil {
+		return err
+	}
+	if bound != base {
+		return fmt.Errorf("此数据目录已绑定其他 Sub2API 地址；迁移域名时请先备份并确认实例，独立站点请使用独立 DATA_DIR")
+	}
+	return nil
+}
+
 func openStore(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {

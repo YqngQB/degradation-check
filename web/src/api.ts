@@ -50,46 +50,66 @@ export interface RunningTest {
   started_at: string
 }
 
-// Remove credentials left by older deployments. URL removal cannot erase
-// an initial request already recorded by a reverse proxy; rotate exposed tokens.
-for (const key of ['dc.token', 'dc.base']) sessionStorage.removeItem(key)
-const url = new URL(location.href)
-if (url.searchParams.has('token') || url.searchParams.has('src_host')) {
-  url.searchParams.delete('token')
-  url.searchParams.delete('src_host')
-  history.replaceState(null, '', url.pathname + url.search + url.hash)
-}
+// Accept the original menu link once; keep only an opaque detector session.
+function stored(key: string): string { try { return sessionStorage.getItem(key) || '' } catch { return '' } }
+function save(key: string, value: string) { try { if (value) sessionStorage.setItem(key, value); else sessionStorage.removeItem(key) } catch {} }
+const entry = new URL(location.href)
+let entryToken = entry.searchParams.get('token') || stored('dc.token')
+let entrySource = entry.searchParams.get('src_host') || entry.searchParams.get('host') || stored('dc.base')
+for (const key of ['token', 'src_host', 'host']) entry.searchParams.delete(key)
+history.replaceState(null, '', entry.pathname + entry.search + entry.hash)
+save('dc.token', ''); save('dc.base', '')
+let session = stored('dc.session')
 
 export interface ServiceConfig {
-  mode: 'direct' | 'sub2api'
+  mode: 'auto' | 'direct' | 'sub2api'
   instance: string
+  sub2api_url?: string
 }
-
-export function getServiceConfig(): Promise<ServiceConfig> {
-  return request('/api/config')
+export class APIError extends Error {
+  constructor(message: string, public status: number, public code = '') { super(message) }
 }
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export function hasSession() { return !!session }
+export function clearSession() { session = ''; save('dc.session', '') }
+export async function connect(token: string, source = '') {
+  const data = await request<{session: string}>('/api/session', { method: 'POST', body: JSON.stringify({token, src_host: source}) })
+  session = data.session; save('dc.session', session)
+}
+export async function connectFromMenu() {
+  const token = entryToken, source = entrySource
+  entryToken = ''; entrySource = ''
+  if (token) await connect(token, source)
+}
+export function getServiceConfig(): Promise<ServiceConfig> { return request('/api/config') }
+export function verifyStepUp(code: string): Promise<{verified: boolean}> {
+  return request('/api/step-up', {method: 'POST', body: JSON.stringify({code})})
+}
+async function response(path: string, init?: RequestInit): Promise<Response> {
   const res = await fetch(path, {
     ...init,
     credentials: 'same-origin',
     headers: {
       'X-DC-Request': '1',
+      ...(session ? {'X-DC-Session': session} : {}),
       ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
       ...(init?.headers || {})
     }
   })
-  const text = await res.text()
-  let data: any = null
-  try {
-    data = text ? JSON.parse(text) : null
-  } catch {
-    data = null
-  }
   if (!res.ok) {
-    throw new Error(res.status === 401 ? '登录已失效，请重新打开页面并登录检测服务' : data?.error || `请求失败（HTTP ${res.status}）`)
+    const data = await res.json().catch(() => null)
+    if (res.status === 401) clearSession()
+    throw new APIError(data?.error || `请求失败（HTTP ${res.status}）`, res.status, data?.code)
   }
-  return data as T
+  return res
+}
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return (await response(path, init)).json()
+}
+export async function getPreview(accountId: number): Promise<string> {
+  const html = await (await response(`/api/preview/${accountId}`)).text()
+  // srcdoc does not inherit the fetched response's CSP header. Reapply it before
+  // any generated content, and also sandbox the frame without allow-same-origin.
+  return `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; base-uri 'none'; form-action 'none'">` + html
 }
 
 export function getAccounts(): Promise<{ accounts: Account[] }> {
@@ -119,9 +139,4 @@ export function runTest(payload: {
 export function clearResults(testType?: TestType): Promise<{ removed: number }> {
   const qs = testType ? `?test_type=${testType}` : ''
   return request(`/api/results${qs}`, { method: 'DELETE' })
-}
-
-export function previewUrl(accountId: number, stamp?: string): string {
-  const v = stamp ? new Date(stamp).getTime() : Date.now()
-  return `/api/preview/${accountId}?v=${v}`
 }

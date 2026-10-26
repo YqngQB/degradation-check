@@ -1,6 +1,6 @@
 # 降智检测（Degradation Check）
 
-> **Fork 说明：** 本仓库增加了上游直连 Responses / Chat Completions 的检测修复。下文保留原项目说明；本 fork 当前默认使用服务端渠道配置和检测服务登录，不再采用下文的 URL 管理员令牌接入方式。部署、升级及模式差异请先看 [修复版使用说明](docs/direct-upstream.md)。下文指向 `jaychou778` 的镜像和克隆命令获取的是原版，不包含本 fork 的修复。
+> **Fork 说明：** 本仓库修复 Responses / Chat Completions 检测题目转发，保留原版菜单自动登录、加载账号及单项/批量检测。只需在检测服务设置一次 `SUB2API_BASE_URL`；所选 OpenAI API Key 账号的上游信息由服务端读取，无需重复配置每个 Key。需要时按提示完成二次验证。下文保留原项目说明，部署与兼容范围请先看 [修复版使用说明](docs/direct-upstream.md)。下文指向 `jaychou778` 的镜像和克隆命令获取的是原版，不包含本 fork 的修复。
 
 给 AI 中转站用的**降智自检面板**：判断一个账号还是不是"原来那个模型"，有没有被偷偷降档、降级或换型号。
 

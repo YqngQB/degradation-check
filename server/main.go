@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,11 @@ func main() {
 		log.Fatalf("打开数据库失败: %v", err)
 	}
 	defer func() { _ = store.Close() }()
+	if cfg.Mode == "auto" {
+		if err := store.bindInstance(cfg.AdminBase); err != nil {
+			log.Fatal(err)
+		}
+	}
 
 	app := &App{cfg: cfg, store: store, upstream: newUpstreamClient(cfg)}
 	mux := http.NewServeMux()
@@ -52,7 +58,7 @@ func main() {
 	addr := net.JoinHostPort(cfg.Host, cfg.Port)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           withCommonHeaders(withAuth(cfg, mux)),
+		Handler:           withCommonHeaders(app.authentication(mux), cfg.PublicBase),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	log.Printf("[%s] listening on %s (data: %s)", cfg.Instance, addr, cfg.DataDir)
@@ -84,12 +90,37 @@ func spaHandler(fsys fs.FS, next http.Handler, instance string) http.Handler {
 }
 
 // withCommonHeaders 允许被 Sub2API 的自定义菜单 iframe 嵌入，并做最小安全隔离。
-func withCommonHeaders(next http.Handler) http.Handler {
+func withCommonHeaders(next http.Handler, parents ...string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
-		h.Set("Content-Security-Policy", "frame-ancestors 'self'; object-src 'none'; base-uri 'self'")
+		ancestors := "'self'"
+		// Sandboxed srcdoc previews have an opaque origin: their inherited CSP
+		// cannot match the detector parent using 'self'. Name this response's
+		// own origin explicitly as well. Only a validated host/scheme enters CSP.
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		if forwarded := r.Header.Get("X-Forwarded-Proto"); forwarded == "http" || forwarded == "https" {
+			scheme = forwarded
+		}
+		validHost := r.Host != ""
+		for _, ch := range r.Host {
+			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || strings.ContainsRune(".-:[]", ch)) {
+				validHost = false
+			}
+		}
+		if validHost {
+			ancestors += " " + scheme + "://" + r.Host
+		}
+		for _, parent := range parents {
+			if parsed, err := url.Parse(parent); err == nil && parsed.Host != "" && (parsed.Scheme == "https" || parsed.Scheme == "http") {
+				ancestors += " " + parsed.Scheme + "://" + parsed.Host
+			}
+		}
+		h.Set("Content-Security-Policy", "frame-ancestors "+ancestors+"; object-src 'none'; base-uri 'self'")
 		next.ServeHTTP(w, r)
 	})
 }

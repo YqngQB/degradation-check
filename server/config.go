@@ -20,12 +20,17 @@ type Endpoint struct {
 	Models          []string `json:"models,omitempty"`
 	MaxOutputTokens int      `json:"max_output_tokens,omitempty"`
 	apiKey          string
+	modelMapping    map[string]string
+	headers         map[string]string
+	proxyURL        string
+	secrets         []string
 }
 
 type config struct {
 	Host, Port, DataDir, Instance string
 	AuthUser, AuthPassword        string
 	Mode, AdminBase, AdminToken   string
+	PublicBase                    string
 	Endpoints                     []Endpoint
 }
 
@@ -41,13 +46,27 @@ func loadConfig() (config, error) {
 		Host: envDefault("HOST", "127.0.0.1"), Port: envDefault("PORT", "8088"),
 		DataDir: envDefault("DATA_DIR", "./data"), Instance: envDefault("INSTANCE_NAME", "降智检测"),
 		AuthUser: os.Getenv("DC_AUTH_USER"), AuthPassword: os.Getenv("DC_AUTH_PASSWORD"),
-		Mode:      envDefault("DETECTION_MODE", "direct"),
+		Mode:      envDefault("DETECTION_MODE", "auto"),
 		AdminBase: os.Getenv("SUB2API_BASE_URL"), AdminToken: os.Getenv("SUB2API_ADMIN_TOKEN"),
+		PublicBase: os.Getenv("SUB2API_PUBLIC_URL"),
 	}
-	if cfg.AuthUser == "" || strings.Contains(cfg.AuthUser, ":") || len(cfg.AuthPassword) < 16 {
+	if (cfg.Mode != "auto" || cfg.AuthUser != "" || cfg.AuthPassword != "") && (cfg.AuthUser == "" || strings.Contains(cfg.AuthUser, ":") || len(cfg.AuthPassword) < 16) {
 		return cfg, fmt.Errorf("设置 DC_AUTH_USER（不含冒号）及至少 16 字符的 DC_AUTH_PASSWORD；所有页面和结果均需要认证")
 	}
 	switch cfg.Mode {
+	case "auto":
+		if err := validateBase(cfg.AdminBase); err != nil {
+			return cfg, fmt.Errorf("自动账号模式需要设置 SUB2API_BASE_URL（官方后台地址）: %w", err)
+		}
+		if cfg.PublicBase == "" {
+			cfg.PublicBase = cfg.AdminBase
+		}
+		if err := validateBase(cfg.PublicBase); err != nil {
+			return cfg, fmt.Errorf("SUB2API_PUBLIC_URL: %w", err)
+		}
+		cfg.AdminBase = strings.TrimRight(cfg.AdminBase, "/")
+		cfg.PublicBase = strings.TrimRight(cfg.PublicBase, "/")
+		cfg.AdminToken = "" // Browser admin JWTs belong to isolated, expiring sessions.
 	case "direct":
 		path := envDefault("UPSTREAMS_FILE", "./upstreams.json")
 		data, err := os.ReadFile(path)
@@ -91,7 +110,7 @@ func loadConfig() (config, error) {
 			return cfg, fmt.Errorf("兼容模式需要有效的 SUB2API_BASE_URL 和 SUB2API_ADMIN_TOKEN")
 		}
 	default:
-		return cfg, fmt.Errorf("DETECTION_MODE 必须是 direct 或 sub2api")
+		return cfg, fmt.Errorf("DETECTION_MODE 必须是 auto、direct 或 sub2api")
 	}
 	return cfg, nil
 }

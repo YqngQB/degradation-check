@@ -1,6 +1,6 @@
 services:
   degradation-check:
-    image: degradation-check:direct-local
+    image: degradation-check:auto-local
     build: .
     container_name: degradation-check
     restart: unless-stopped
@@ -9,12 +9,10 @@ services:
     volumes:
       # 测试结果存在这里（SQLite 单文件），备份就是拷这个目录
       - ./data:/data
-      - ./upstreams.json:/app/upstreams.json:ro
     env_file:
       - .env
     environment:
       - TZ=Asia/Shanghai
       - HOST=0.0.0.0
-      - UPSTREAMS_FILE=/app/upstreams.json
       # 页面右上角显示的实例名，随便改
       - INSTANCE_NAME=降智检测

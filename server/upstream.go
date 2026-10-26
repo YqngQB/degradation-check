@@ -77,28 +77,45 @@ func (u *Upstream) do(ctx context.Context, base, token, method, path string, bod
 
 // Accounts 拉账号列表。不同 Sub2API 版本的字段略有差异，这里做兼容取值。
 func (u *Upstream) adminAccounts(ctx context.Context, base, token string) ([]Account, error) {
-	resp, err := u.do(ctx, base, token, http.MethodGet, "/api/v1/admin/accounts?page=1&page_size=1000", nil)
-	if err != nil {
-		return nil, fmt.Errorf("请求 Sub2API 失败: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Sub2API 返回 %d: %s", resp.StatusCode, truncate(string(raw), 300))
-	}
-
-	var envelope struct {
-		Data struct {
+	var items []map[string]any
+	seen := make(map[int64]bool)
+	for page := 1; ; page++ {
+		if page > 1000 {
+			return nil, fmt.Errorf("账号列表分页超过上限")
+		}
+		resp, err := u.do(ctx, base, token, http.MethodGet, fmt.Sprintf("/api/v1/admin/accounts?page=%d&page_size=100", page), nil)
+		if err != nil {
+			return nil, fmt.Errorf("请求 Sub2API 失败")
+		}
+		var envelope struct {
+			Data struct {
+				Items []map[string]any `json:"items"`
+				Total int              `json:"total"`
+			} `json:"data"`
 			Items []map[string]any `json:"items"`
-		} `json:"data"`
-		Items []map[string]any `json:"items"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return nil, fmt.Errorf("解析账号列表失败: %w", err)
-	}
-	items := envelope.Data.Items
-	if len(items) == 0 {
-		items = envelope.Items
+			Total int              `json:"total"`
+		}
+		if err := decodeAdmin(resp, &envelope); err != nil {
+			return nil, err
+		}
+		batch, total := envelope.Data.Items, envelope.Data.Total
+		if batch == nil {
+			batch, total = envelope.Items, envelope.Total
+		}
+		for _, item := range batch {
+			id := toInt64(item["id"])
+			if id <= 0 || seen[id] {
+				return nil, fmt.Errorf("账号分页重复或 ID 无效，请刷新重试")
+			}
+			seen[id] = true
+			items = append(items, item)
+		}
+		if (total > 0 && len(items) >= total) || (total == 0 && len(batch) < 100) {
+			break
+		}
+		if len(batch) == 0 {
+			return nil, fmt.Errorf("账号分页提前结束")
+		}
 	}
 
 	out := make([]Account, 0, len(items))
@@ -119,6 +136,10 @@ func (u *Upstream) adminAccounts(ctx context.Context, base, token string) ([]Acc
 		// email / plan_type 可能直接在顶层，也可能埋在 credentials / extra 里。
 		a.Email = firstNonEmpty(toString(m["email"]), nested(m, "credentials", "email"), nested(m, "extra", "email_address"))
 		a.PlanType = firstNonEmpty(toString(m["plan_type"]), nested(m, "credentials", "plan_type"))
+		if a.Platform == "openai" && a.Type == "apikey" {
+			extra, _ := m["extra"].(map[string]any)
+			a.Protocol = accountProtocol(extra)
+		}
 		out = append(out, a)
 	}
 	return out, nil

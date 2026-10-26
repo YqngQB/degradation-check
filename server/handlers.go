@@ -16,6 +16,7 @@ type App struct {
 	cfg      config
 	store    *Store
 	upstream *Upstream
+	sessions *sessionStore
 
 	mu      sync.Mutex
 	running map[string]time.Time
@@ -35,6 +36,8 @@ func (a *App) initRuntime() {
 
 func (a *App) routes(mux *http.ServeMux) {
 	a.initRuntime()
+	mux.HandleFunc("POST /api/session", a.handleSession)
+	mux.HandleFunc("POST /api/step-up", a.handleStepUp)
 	mux.HandleFunc("GET /api/health", a.handleHealth)
 	mux.HandleFunc("GET /api/config", a.handleConfig)
 	mux.HandleFunc("GET /api/variants", a.handleVariants)
@@ -66,7 +69,7 @@ func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"mode": a.cfg.Mode, "instance": a.cfg.Instance})
+	writeJSON(w, http.StatusOK, map[string]any{"mode": a.cfg.Mode, "instance": a.cfg.Instance, "sub2api_url": a.cfg.PublicBase})
 }
 
 func (a *App) handleVariants(w http.ResponseWriter, r *http.Request) {
@@ -77,10 +80,7 @@ func (a *App) handleVariants(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
-
-	list, err := a.upstream.Accounts(ctx)
+	list, err := a.requestAccounts(r)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, a.upstream.redact(err.Error()))
 		return
@@ -163,7 +163,7 @@ func (a *App) handleRun(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve IDs and metadata from server configuration/admin API. Ignore any
 	// destination, credentials or account metadata supplied by the browser.
-	accounts, err := a.upstream.Accounts(r.Context())
+	accounts, err := a.requestAccounts(r)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, a.upstream.redact(err.Error()))
 		return
@@ -179,11 +179,26 @@ func (a *App) handleRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	selected := make([]Account, 0, len(req.AccountIDs))
+	unique := make(map[int64]bool)
+	for _, id := range req.AccountIDs {
+		if !unique[id] {
+			selected = append(selected, meta[id])
+			unique[id] = true
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	upstream, err := a.requestUpstream(r).prepared(ctx, selected)
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+
 	started, skipped := 0, 0
 	var lastErr string
-	for _, id := range req.AccountIDs {
-		acc := meta[id]
-		if err := a.startTest(acc, req); err != nil {
+	for _, acc := range selected {
+		if err := a.startTest(acc, req, upstream); err != nil {
 			skipped++
 			lastErr = err.Error()
 			continue
@@ -198,7 +213,7 @@ func (a *App) handleRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, payload)
 }
 
-func (a *App) startTest(acc Account, req runRequest) error {
+func (a *App) startTest(acc Account, req runRequest, upstream *Upstream) error {
 	key := fmt.Sprintf("%d:%s", acc.ID, req.TestType)
 
 	a.mu.Lock()
@@ -217,27 +232,28 @@ func (a *App) startTest(acc Account, req runRequest) error {
 			delete(a.running, key)
 			a.mu.Unlock()
 			if rec := recover(); rec != nil {
-				fmt.Printf("[runner] panic account=%d test=%s: %v\n", acc.ID, req.TestType, rec)
+				fmt.Printf("[runner] panic account=%d test=%s\n", acc.ID, req.TestType)
 			}
 		}()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 		defer cancel()
 
+		job := &App{cfg: a.cfg, upstream: upstream}
 		var result *Result
 		switch req.TestType {
 		case TestCandy:
-			result = a.runCandy(ctx, acc, req.Model, req.Effort, req.Runs)
+			result = job.runCandy(ctx, acc, req.Model, req.Effort, req.Runs)
 		case TestPelican:
-			result = a.runPelican(ctx, acc, req.Model, req.Effort, req.Variant)
+			result = job.runPelican(ctx, acc, req.Model, req.Effort, req.Variant)
 		case TestFingerprint:
-			result = a.runFingerprint(ctx, acc, req.Model)
+			result = job.runFingerprint(ctx, acc, req.Model)
 		}
 		if result == nil {
 			return
 		}
 		result.TestedAt = time.Now()
-		result.Error = a.upstream.redact(result.Error)
+		result.Error = upstream.redact(result.Error)
 		if err := a.store.Upsert(result); err != nil {
 			fmt.Printf("[store] upsert account=%d: %v\n", acc.ID, err)
 		}

@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import ServiceInfo from './ServiceInfo.vue'
+import ResultPreview from './ResultPreview.vue'
+import StepUpDialog from './StepUpDialog.vue'
 import {
   clearResults,
   getServiceConfig,
   getAccounts,
   getResults,
-  previewUrl,
+  APIError, connect, connectFromMenu, hasSession, clearSession,
   runTest,
   type Account,
   type Result,
@@ -37,7 +39,11 @@ const error = ref('')
 const showSettings = ref(false)
 const previewId = ref<number | null>(null)
 
-const serviceMode = ref<'direct' | 'sub2api'>('direct')
+const serviceMode = ref<'auto' | 'direct' | 'sub2api'>('auto')
+const sub2apiUrl = ref('')
+const loginToken = ref('')
+const showStepUp = ref(false)
+const pendingTest = ref<Parameters<typeof runTest>[0] | null>(null)
 const instanceName = ref('降智检测')
 
 const active = ref<TestType>('candy')
@@ -81,7 +87,7 @@ const filtered = computed(() => (platform.value ? accounts.value.filter((a) => a
 
 function platformMatches(p: string, m: string): boolean {
   // A relay may expose custom model aliases unrelated to provider prefixes.
-  if (serviceMode.value === 'direct') return true
+  if (serviceMode.value !== 'sub2api') return true
   const name = m.toLowerCase()
   switch (p.toLowerCase()) {
     case 'openai':
@@ -104,6 +110,7 @@ const skippedByModel = computed(() => filtered.value.filter((a) => !platformMatc
 const runnable = computed(() => filtered.value.filter((a) => blockedReason(a) === ''))
 
 function blockedReason(a: Account): string {
+  if (serviceMode.value === 'auto' && (a.platform !== 'openai' || a.type !== 'apikey')) return '自动直连目前仅支持 OpenAI API Key 账号'
   if (a.status && a.status !== 'active') return `账号状态为 ${a.status}`
   if (a.schedulable === false) return '账号已被暂停调度'
   if (!platformMatches(a.platform, model.value)) return `模型 ${model.value} 不适用于 ${a.platform} 平台`
@@ -119,10 +126,6 @@ function isRunning(id: number) {
 function hasPreview(id: number) {
   const r = resultOf(id)
   return !!(r && r.payload && r.payload.html)
-}
-function previewSrc(id: number) {
-  const r = resultOf(id)
-  return previewUrl(id, r?.tested_at)
 }
 function attributionOf(id: number) {
   const r = resultOf(id)
@@ -193,7 +196,7 @@ async function reloadAll(withAccounts = false) {
     syncedAt.value = stamp()
     error.value = ''
   } catch (e: any) {
-    error.value = e?.message || '加载失败'
+    handleError(e, '加载失败')
   } finally {
     loading.value = false
     schedulePoll()
@@ -215,6 +218,11 @@ async function initialize() {
     const config = await getServiceConfig()
     serviceMode.value = config.mode
     instanceName.value = config.instance
+    sub2apiUrl.value = config.sub2api_url || ''
+    if (config.mode === 'auto') {
+      await connectFromMenu()
+      if (!hasSession()) { ready.value = false; return }
+    }
     ready.value = true
     await reloadAll(true)
   } catch (e: any) {
@@ -231,7 +239,7 @@ async function runAll() {
   try {
     const targets = runnable.value
     const skipped = filtered.value.length - targets.length
-    const res = await runTest({
+    const res = await sendTest({
       account_ids: targets.map((a) => a.id),
       test_type: active.value,
       model: model.value,
@@ -240,11 +248,12 @@ async function runAll() {
       runs: runs.value,
       accounts: targets.map((a) => ({ id: a.id, name: a.name, email: a.email, platform: a.platform, type: a.type }))
     })
+    if (!res) return
     if (res.skipped > 0 && res.message) error.value = res.message
     else if (skipped > 0) error.value = `已跳过 ${skipped} 个不匹配或不活跃的账号`
     await reloadAll(false)
   } catch (e: any) {
-    error.value = e?.message || '发起测试失败'
+    handleError(e, '发起测试失败')
   } finally {
     submitting.value = false
   }
@@ -254,7 +263,7 @@ async function runOne(id: number) {
   const acc = accounts.value.find((a) => a.id === id)
   if (!acc) return
   try {
-    await runTest({
+    const res = await sendTest({
       account_ids: [id],
       test_type: active.value,
       model: model.value,
@@ -263,9 +272,9 @@ async function runOne(id: number) {
       runs: runs.value,
       accounts: [{ id: acc.id, name: acc.name, email: acc.email, platform: acc.platform, type: acc.type }]
     })
-    await reloadAll(false)
+    if (res) await reloadAll(false)
   } catch (e: any) {
-    error.value = e?.message || '发起测试失败'
+    handleError(e, '发起测试失败')
   }
 }
 
@@ -276,7 +285,7 @@ async function clearAll() {
     await clearResults(active.value)
     await reloadAll(false)
   } catch (e: any) {
-    error.value = e?.message || '清空失败'
+    handleError(e, '清空失败')
   } finally {
     clearing.value = false
   }
@@ -286,6 +295,43 @@ function openPreview(id: number) {
   previewId.value = id
 }
 
+function handleError(e: any, fallback: string) {
+  error.value = e?.message || fallback
+  if (e instanceof APIError && e.status === 401 && serviceMode.value === 'auto') {
+    ready.value = false; accounts.value = []; results.value = []; running.value = []
+    showStepUp.value = false; pendingTest.value = null
+  }
+}
+async function connectManually() {
+  loading.value = true; error.value = ''
+  const token = loginToken.value; loginToken.value = ''
+  try { await connect(token); ready.value = true; await reloadAll(true) }
+  catch (e) { handleError(e, '连接失败') }
+  finally { loading.value = false }
+}
+async function sendTest(payload: Parameters<typeof runTest>[0]) {
+  try { return await runTest(payload) }
+  catch (e) {
+    if (e instanceof APIError && e.code === 'STEP_UP_REQUIRED') {
+      pendingTest.value = payload; showStepUp.value = true
+      return null
+    }
+    throw e
+  }
+}
+async function retryVerified() {
+  showStepUp.value = false
+  const payload = pendingTest.value; pendingTest.value = null
+  if (!payload) return
+  submitting.value = true
+  try { const res = await sendTest(payload); if (res) await reloadAll(false) }
+  catch (e) { handleError(e, '发起测试失败') }
+  finally { submitting.value = false }
+}
+function reconnect() {
+  clearSession(); ready.value = false; accounts.value = []; results.value = []; running.value = []
+  if (timer) clearTimeout(timer)
+}
 onMounted(initialize)
 
 onBeforeUnmount(() => {
@@ -311,18 +357,26 @@ onBeforeUnmount(() => {
         </div>
         <div class="flex items-center gap-2">
           <span v-if="ready" class="hidden text-xs text-gray-400 sm:inline dark:text-dark-500">
-            {{ serviceMode === 'direct' ? '上游直连' : 'Sub2API 兼容模式' }}
+            {{ serviceMode === 'sub2api' ? 'Sub2API 兼容模式' : '上游直连' }}
           </span>
           <button class="btn btn-secondary" :disabled="loading" @click="reloadAll(true)">刷新</button>
           <button class="btn btn-secondary" @click="showSettings = true">连接说明</button>
+          <button v-if="ready && serviceMode === 'auto'" class="btn btn-secondary" @click="reconnect">重新连接</button>
         </div>
       </div>
     </header>
 
     <div v-if="!ready" class="mx-auto max-w-lg px-6 py-16" role="status">
-      <h2 class="text-lg font-semibold">{{ loading ? '正在加载检测渠道…' : '无法加载检测服务' }}</h2>
+      <h2 class="text-lg font-semibold">{{ loading ? '正在加载检测账号…' : serviceMode === 'auto' ? '连接 Sub2API' : '无法加载检测服务' }}</h2>
       <p v-if="error" class="mt-3 text-sm text-red-600" role="alert">{{ error }}</p>
-      <button class="btn btn-secondary mt-4" :disabled="loading" @click="initialize">重试</button>
+      <form v-if="serviceMode === 'auto' && !loading" class="mt-4 space-y-3" @submit.prevent="connectManually">
+        <p class="text-sm text-gray-500">从 Sub2API 后台菜单进入会自动连接。也可填写管理员登录令牌连接 {{ sub2apiUrl }}。</p>
+        <label class="block text-sm">管理员登录令牌
+          <input v-model="loginToken" type="password" class="input mt-1" autocomplete="off" required aria-label="管理员登录令牌" />
+        </label>
+        <button class="btn btn-primary" :disabled="loading || !loginToken">连接并加载账号</button>
+      </form>
+      <button v-else class="btn btn-secondary mt-4" :disabled="loading" @click="initialize">重试</button>
     </div>
 
     <!-- 主内容 -->
@@ -479,14 +533,15 @@ onBeforeUnmount(() => {
                 title="点击放大"
                 @click="openPreview(acc.id)"
               >
-                <iframe
-                  :src="previewSrc(acc.id)"
+                <ResultPreview
+                  :account-id="acc.id"
+                  :stamp="resultOf(acc.id)?.tested_at"
                   sandbox="allow-scripts"
                   title="检测画面缩略图"
                   tabindex="-1"
                   class="pointer-events-none origin-top-left"
                   style="transform: scale(0.12); width: 800px; height: 450px"
-                ></iframe>
+                ></ResultPreview>
               </button>
               <span v-else class="text-xs text-gray-400">—</span>
             </template>
@@ -535,10 +590,11 @@ onBeforeUnmount(() => {
           <span class="text-sm font-medium">账号 #{{ previewId }} 的画面</span>
           <button class="btn btn-secondary px-3 py-1 text-xs" @click="previewId = null">关闭</button>
         </div>
-        <iframe :src="previewSrc(previewId)" sandbox="allow-scripts" title="检测画面预览" class="h-[70vh] w-full"></iframe>
+        <ResultPreview :account-id="previewId" title="检测画面预览" class="h-[70vh] w-full" />
       </div>
     </div>
 
+    <StepUpDialog v-if="showStepUp" @verified="retryVerified" @close="showStepUp = false; pendingTest = null" />
     <ServiceInfo v-if="showSettings" :mode="serviceMode" @close="showSettings = false" />
   </div>
 </template>

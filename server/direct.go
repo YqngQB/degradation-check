@@ -7,12 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
 func (u *Upstream) Accounts(ctx context.Context) ([]Account, error) {
-	if u.cfg.Mode == "sub2api" {
+	if u.cfg.Mode == "sub2api" || u.cfg.Mode == "auto" {
 		return u.adminAccounts(ctx, u.cfg.AdminBase, u.cfg.AdminToken)
 	}
 	accounts := make([]Account, 0, len(u.cfg.Endpoints))
@@ -44,6 +45,7 @@ func (u *Upstream) redact(text string) string {
 	secrets := []string{u.cfg.AdminToken, u.cfg.AuthPassword}
 	for _, ep := range u.cfg.Endpoints {
 		secrets = append(secrets, ep.apiKey)
+		secrets = append(secrets, ep.secrets...)
 	}
 	for _, secret := range secrets {
 		if secret != "" {
@@ -77,7 +79,7 @@ func endpointURL(ep Endpoint) string {
 
 func (u *Upstream) testDirect(ctx context.Context, ep Endpoint, model, prompt, effort string) (*TestOutcome, error) {
 	started := time.Now()
-	payload := map[string]any{"model": model, "stream": true}
+	payload := map[string]any{"model": mappedModel(ep, model), "stream": true}
 	if ep.Protocol == "responses" {
 		payload["input"] = []map[string]any{{"role": "user", "content": []map[string]any{{"type": "input_text", "text": prompt}}}}
 		payload["store"] = false
@@ -97,9 +99,37 @@ func (u *Upstream) testDirect(ctx context.Context, ep Endpoint, model, prompt, e
 			payload["max_completion_tokens"] = ep.MaxOutputTokens
 		}
 	}
-	// Use do with the complete, configured API endpoint; the browser cannot
+	// Use the complete, server-resolved API endpoint; the browser cannot
 	// supply a destination or a credential. No fallback changes protocol.
-	resp, err := u.do(ctx, endpointURL(ep), ep.apiKey, http.MethodPost, "", payload)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("生成检测请求失败")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(ep), strings.NewReader(string(data)))
+	if err != nil {
+		return nil, fmt.Errorf("上游地址格式不正确")
+	}
+	for key, value := range ep.headers {
+		req.Header.Set(key, value)
+	}
+	req.Header.Set("Authorization", "Bearer "+ep.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream, application/json")
+	client := *u.client
+	if u.cfg.Mode == "auto" || ep.proxyURL != "" {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.Proxy = nil
+		if ep.proxyURL != "" {
+			proxy, parseErr := url.Parse(ep.proxyURL)
+			if parseErr != nil {
+				return nil, fmt.Errorf("代理地址格式不正确")
+			}
+			transport.Proxy = http.ProxyURL(proxy)
+		}
+		defer transport.CloseIdleConnections()
+		client.Transport = transport
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, u.safeError(fmt.Errorf("上游连接失败: %w", err))
 	}
