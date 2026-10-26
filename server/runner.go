@@ -80,7 +80,7 @@ const (
 )
 
 // runCandy 跑 N 次糖果题，判定是否出现独立的 21。
-func (a *App) runCandy(ctx context.Context, base, token string, acc Account, model, effort string, runs int) *Result {
+func (a *App) runCandy(ctx context.Context, acc Account, model, effort string, runs int) *Result {
 	if runs <= 0 {
 		runs = 1
 	}
@@ -92,7 +92,7 @@ func (a *App) runCandy(ctx context.Context, base, token string, acc Account, mod
 	var last *TestOutcome
 	lastText := ""
 	for i := 0; i < runs; i++ {
-		out, err := a.upstream.TestAccount(ctx, base, token, acc.ID, model, candyPrompt)
+		out, err := a.upstream.TestAccount(ctx, acc.ID, model, candyPrompt, effort)
 		if err != nil {
 			r.Status, r.Error = StatusFailed, err.Error()
 			return r
@@ -100,7 +100,8 @@ func (a *App) runCandy(ctx context.Context, base, token string, acc Account, mod
 		last = out
 		lastText = out.Text
 		if out.Error != "" {
-			r.Error = out.Error
+			r.Status, r.Error = StatusFailed, out.Error
+			return r
 		}
 	}
 
@@ -125,14 +126,14 @@ func (a *App) runCandy(ctx context.Context, base, token string, acc Account, mod
 }
 
 // runPelican 跑一次画鹈鹕，提取可渲染的文档。
-func (a *App) runPelican(ctx context.Context, base, token string, acc Account, model, effort, variantID string) *Result {
+func (a *App) runPelican(ctx context.Context, acc Account, model, effort, variantID string) *Result {
 	variant, ok := FindVariant(variantID)
 	if !ok {
 		variant = PelicanVariants[0]
 	}
 	r := a.newResult(acc, TestPelican, model, effort, variant.ID, nil)
 
-	out, err := a.upstream.TestAccount(ctx, base, token, acc.ID, model, variant.Prompt)
+	out, err := a.upstream.TestAccount(ctx, acc.ID, model, variant.Prompt, effort)
 	if err != nil {
 		r.Status, r.Error = StatusFailed, err.Error()
 		r.Payload, _ = json.Marshal(map[string]any{"html": ""})
@@ -148,7 +149,7 @@ func (a *App) runPelican(ctx context.Context, base, token string, acc Account, m
 	html := extractDocument(out.Text, variant.Format)
 	if strings.TrimSpace(html) == "" {
 		r.Status = StatusFailed
-		r.Error = "回答里没有找到可渲染的代码块"
+		r.Error = "回答里没有找到 HTML/SVG；请展开详情检查实际回答，不据此判定降智"
 		r.Payload, _ = json.Marshal(map[string]any{"html": "", "raw": truncateRunes(out.Text, 1200)})
 		return r
 	}
@@ -158,7 +159,7 @@ func (a *App) runPelican(ctx context.Context, base, token string, acc Account, m
 }
 
 // runFingerprint 采集三组随机整数序列并做模型归因。
-func (a *App) runFingerprint(ctx context.Context, base, token string, acc Account, model string) *Result {
+func (a *App) runFingerprint(ctx context.Context, acc Account, model string) *Result {
 	r := a.newResult(acc, TestFingerprint, model, "", "", nil)
 
 	samples := make([]map[string]any, 0, fingerprintSamples)
@@ -168,9 +169,13 @@ func (a *App) runFingerprint(ctx context.Context, base, token string, acc Accoun
 
 	for i := 0; i < fingerprintSamples; i++ {
 		prompt := fmt.Sprintf("请生成 %d 个 1 到 355 之间的随机整数，用逗号分隔，不要解释，不要编号。", fingerprintNumbers)
-		out, err := a.upstream.TestAccount(ctx, base, token, acc.ID, model, prompt)
+		out, err := a.upstream.TestAccount(ctx, acc.ID, model, prompt, "")
 		if err != nil {
 			samples = append(samples, map[string]any{"error": err.Error()})
+			continue
+		}
+		if out.Error != "" {
+			samples = append(samples, map[string]any{"error": out.Error})
 			continue
 		}
 		total += out.Duration

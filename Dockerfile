@@ -5,9 +5,10 @@ FROM node:22-alpine AS web
 ARG NPM_REGISTRY=
 WORKDIR /app/web
 COPY web/package.json web/pnpm-lock.yaml* ./
+COPY web/pnpm-workspace.yaml ./
 RUN corepack enable && corepack prepare pnpm@9 --activate && \
     if [ -n "${NPM_REGISTRY}" ]; then pnpm config set registry "${NPM_REGISTRY}"; fi && \
-    (pnpm install --frozen-lockfile --prefer-offline || pnpm install)
+    pnpm install --frozen-lockfile --prefer-offline
 COPY web/ ./
 RUN pnpm build
 

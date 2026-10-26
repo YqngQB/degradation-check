@@ -1,0 +1,3 @@
+# pnpm 10/11 require explicit approval for the bundler's native binary setup.
+allowBuilds:
+  esbuild: true

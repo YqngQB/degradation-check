@@ -1,0 +1,8 @@
+.git
+.env
+.env.*
+upstreams.json
+data
+dist
+web/node_modules
+server/degradation-check*

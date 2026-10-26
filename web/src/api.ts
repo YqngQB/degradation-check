@@ -1,7 +1,4 @@
-/**
- * 与降智检测服务通信。服务端会把请求转发到 Sub2API，
- * 所以这里只需要带上 Sub2API 的地址和当前管理员令牌。
- */
+/** Credentials and upstream destinations are configured on the server only. */
 
 export interface Account {
   id: number
@@ -13,6 +10,8 @@ export interface Account {
   plan_type: string
   priority: number
   schedulable: boolean
+  protocol?: 'responses' | 'chat_completions'
+  models?: string[]
 }
 
 export type TestType = 'candy' | 'fingerprint' | 'pelican'
@@ -51,41 +50,31 @@ export interface RunningTest {
   started_at: string
 }
 
-export interface Credentials {
-  base: string
-  token: string
+// Remove credentials left by older deployments. URL removal cannot erase
+// an initial request already recorded by a reverse proxy; rotate exposed tokens.
+for (const key of ['dc.token', 'dc.base']) sessionStorage.removeItem(key)
+const url = new URL(location.href)
+if (url.searchParams.has('token') || url.searchParams.has('src_host')) {
+  url.searchParams.delete('token')
+  url.searchParams.delete('src_host')
+  history.replaceState(null, '', url.pathname + url.search + url.hash)
 }
 
-const TOKEN_KEY = 'dc.token'
-const BASE_KEY = 'dc.base'
-
-/** 从 URL（Sub2API 自定义菜单会带 token 和 src_host）或 sessionStorage 取凭据。 */
-export function loadCredentials(): Credentials {
-  const q = new URLSearchParams(location.search)
-  const token = q.get('token') || sessionStorage.getItem(TOKEN_KEY) || ''
-  const host = q.get('src_host') || q.get('host') || sessionStorage.getItem(BASE_KEY) || ''
-  if (token) sessionStorage.setItem(TOKEN_KEY, token)
-  if (host) sessionStorage.setItem(BASE_KEY, host)
-  return { base: host, token }
+export interface ServiceConfig {
+  mode: 'direct' | 'sub2api'
+  instance: string
 }
 
-export function saveCredentials(c: Credentials) {
-  if (c.token) sessionStorage.setItem(TOKEN_KEY, c.token)
-  if (c.base) sessionStorage.setItem(BASE_KEY, c.base)
-}
-
-let creds: Credentials = { base: '', token: '' }
-
-export function setCredentials(c: Credentials) {
-  creds = { base: c.base.replace(/\/+$/, ''), token: c.token }
+export function getServiceConfig(): Promise<ServiceConfig> {
+  return request('/api/config')
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
+    credentials: 'same-origin',
     headers: {
-      'X-Sub2API-Base': creds.base,
-      'X-Sub2API-Token': creds.token,
+      'X-DC-Request': '1',
       ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
       ...(init?.headers || {})
     }
@@ -98,7 +87,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     data = null
   }
   if (!res.ok) {
-    throw new Error(data?.error || `请求失败（HTTP ${res.status}）`)
+    throw new Error(res.status === 401 ? '登录已失效，请重新打开页面并登录检测服务' : data?.error || `请求失败（HTTP ${res.status}）`)
   }
   return data as T
 }

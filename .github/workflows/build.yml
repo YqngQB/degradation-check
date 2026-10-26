@@ -33,12 +33,29 @@ jobs:
       - name: Build frontend
         working-directory: web
         run: |
-          pnpm install --frozen-lockfile || pnpm install
+          pnpm install --frozen-lockfile
           pnpm build
 
-      - name: Build server
+      - name: Test and build server
         working-directory: server
-        run: go build ./...
+        run: |
+          go test ./...
+          go vet ./...
+          go build ./...
+
+      - name: Build Ubuntu binaries
+        working-directory: server
+        run: |
+          mkdir -p ../dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X main.Version=${GITHUB_REF_NAME}" -o ../dist/degradation-check-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w -X main.Version=${GITHUB_REF_NAME}" -o ../dist/degradation-check-linux-arm64 .
+          cd ../dist
+          sha256sum degradation-check-linux-* > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: degradation-check-linux
+          path: dist/
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'

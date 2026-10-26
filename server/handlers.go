@@ -36,31 +36,13 @@ func (a *App) initRuntime() {
 func (a *App) routes(mux *http.ServeMux) {
 	a.initRuntime()
 	mux.HandleFunc("GET /api/health", a.handleHealth)
+	mux.HandleFunc("GET /api/config", a.handleConfig)
 	mux.HandleFunc("GET /api/variants", a.handleVariants)
 	mux.HandleFunc("GET /api/accounts", a.handleAccounts)
 	mux.HandleFunc("GET /api/results", a.handleResults)
 	mux.HandleFunc("POST /api/run", a.handleRun)
 	mux.HandleFunc("DELETE /api/results", a.handleClear)
 	mux.HandleFunc("GET /api/preview/{accountID}", a.handlePreview)
-}
-
-// ---------------- 请求上下文 ----------------
-
-type client struct {
-	Base  string
-	Token string
-}
-
-func readClient(r *http.Request) (client, error) {
-	base := strings.TrimSpace(r.Header.Get("X-Sub2API-Base"))
-	token := strings.TrimSpace(r.Header.Get("X-Sub2API-Token"))
-	if base == "" {
-		return client{}, fmt.Errorf("缺少 Sub2API 地址")
-	}
-	if token == "" {
-		return client{}, fmt.Errorf("缺少 Sub2API 令牌，请从 Sub2API 的「自定义菜单」入口打开本页")
-	}
-	return client{Base: NormalizeBase(base), Token: token}, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -83,6 +65,10 @@ func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"mode": a.cfg.Mode, "instance": a.cfg.Instance})
+}
+
 func (a *App) handleVariants(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"variants": PelicanVariants,
@@ -91,17 +77,12 @@ func (a *App) handleVariants(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
-	c, err := readClient(r)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	list, err := a.upstream.Accounts(ctx, c.Base, c.Token)
+	list, err := a.upstream.Accounts(ctx)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeErr(w, http.StatusBadGateway, a.upstream.redact(err.Error()))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": list})
@@ -152,11 +133,6 @@ type runRequest struct {
 }
 
 func (a *App) handleRun(w http.ResponseWriter, r *http.Request) {
-	c, err := readClient(r)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	var req runRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求体格式错误: "+err.Error())
@@ -174,23 +150,40 @@ func (a *App) handleRun(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "未知的测试类型")
 		return
 	}
+	if strings.TrimSpace(req.Model) == "" || len(req.Model) > 256 {
+		writeErr(w, http.StatusBadRequest, "请填写有效模型名")
+		return
+	}
+	switch req.Effort {
+	case "", "none", "minimal", "low", "medium", "high", "xhigh", "max":
+	default:
+		writeErr(w, http.StatusBadRequest, "不支持的推理强度")
+		return
+	}
 
-	meta := make(map[int64]Account, len(req.Accounts))
-	for _, acc := range req.Accounts {
-		meta[acc.ID] = Account{
-			ID: acc.ID, Name: acc.Name, Email: acc.Email,
-			Platform: acc.Platform, Type: acc.Type,
+	// Resolve IDs and metadata from server configuration/admin API. Ignore any
+	// destination, credentials or account metadata supplied by the browser.
+	accounts, err := a.upstream.Accounts(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, a.upstream.redact(err.Error()))
+		return
+	}
+	meta := make(map[int64]Account, len(accounts))
+	for _, acc := range accounts {
+		meta[acc.ID] = acc
+	}
+	for _, id := range req.AccountIDs {
+		if _, ok := meta[id]; !ok {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("未知的账号 ID: %d", id))
+			return
 		}
 	}
 
 	started, skipped := 0, 0
 	var lastErr string
 	for _, id := range req.AccountIDs {
-		acc, ok := meta[id]
-		if !ok {
-			acc = Account{ID: id}
-		}
-		if err := a.startTest(c, acc, req); err != nil {
+		acc := meta[id]
+		if err := a.startTest(acc, req); err != nil {
 			skipped++
 			lastErr = err.Error()
 			continue
@@ -205,7 +198,7 @@ func (a *App) handleRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, payload)
 }
 
-func (a *App) startTest(c client, acc Account, req runRequest) error {
+func (a *App) startTest(acc Account, req runRequest) error {
 	key := fmt.Sprintf("%d:%s", acc.ID, req.TestType)
 
 	a.mu.Lock()
@@ -234,16 +227,17 @@ func (a *App) startTest(c client, acc Account, req runRequest) error {
 		var result *Result
 		switch req.TestType {
 		case TestCandy:
-			result = a.runCandy(ctx, c.Base, c.Token, acc, req.Model, req.Effort, req.Runs)
+			result = a.runCandy(ctx, acc, req.Model, req.Effort, req.Runs)
 		case TestPelican:
-			result = a.runPelican(ctx, c.Base, c.Token, acc, req.Model, req.Effort, req.Variant)
+			result = a.runPelican(ctx, acc, req.Model, req.Effort, req.Variant)
 		case TestFingerprint:
-			result = a.runFingerprint(ctx, c.Base, c.Token, acc, req.Model)
+			result = a.runFingerprint(ctx, acc, req.Model)
 		}
 		if result == nil {
 			return
 		}
 		result.TestedAt = time.Now()
+		result.Error = a.upstream.redact(result.Error)
 		if err := a.store.Upsert(result); err != nil {
 			fmt.Printf("[store] upsert account=%d: %v\n", acc.ID, err)
 		}
@@ -290,11 +284,10 @@ func (a *App) handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 	w.Header().Set("Content-Security-Policy",
 		"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "+
-			"img-src data: blob:; font-src data:; media-src data: blob:")
+			"img-src data: blob:; font-src data:; media-src data: blob:; sandbox allow-scripts; frame-ancestors 'self'")
 	_, _ = w.Write([]byte(payload.HTML))
 }
 

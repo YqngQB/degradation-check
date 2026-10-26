@@ -15,24 +15,31 @@ import (
 
 // Account 是 Sub2API 账号的最小子集（不同版本字段可能不同，只取稳定字段）。
 type Account struct {
-	ID          int64  `json:"id"`
-	Name        string `json:"name"`
-	Email       string `json:"email"`
-	Platform    string `json:"platform"`
-	Type        string `json:"type"`
-	Status      string `json:"status"`
-	PlanType    string `json:"plan_type"`
-	Priority    int    `json:"priority"`
-	Schedulable bool   `json:"schedulable"`
+	ID          int64    `json:"id"`
+	Name        string   `json:"name"`
+	Email       string   `json:"email"`
+	Platform    string   `json:"platform"`
+	Type        string   `json:"type"`
+	Status      string   `json:"status"`
+	PlanType    string   `json:"plan_type"`
+	Priority    int      `json:"priority"`
+	Schedulable bool     `json:"schedulable"`
+	Protocol    string   `json:"protocol,omitempty"`
+	Models      []string `json:"models,omitempty"`
 }
 
 // Upstream 负责调用 Sub2API 的管理 API。
 type Upstream struct {
 	client *http.Client
+	cfg    config
 }
 
-func newUpstreamClient() *Upstream {
-	return &Upstream{client: &http.Client{Timeout: 15 * time.Minute}}
+func newUpstreamClient(cfg config) *Upstream {
+	return &Upstream{cfg: cfg, client: &http.Client{
+		Timeout: 15 * time.Minute,
+		// Never forward credentials to a redirect target, including subdomains.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+	}}
 }
 
 // NormalizeBase 把用户给的地址补成 https://host 形式。
@@ -69,7 +76,7 @@ func (u *Upstream) do(ctx context.Context, base, token, method, path string, bod
 }
 
 // Accounts 拉账号列表。不同 Sub2API 版本的字段略有差异，这里做兼容取值。
-func (u *Upstream) Accounts(ctx context.Context, base, token string) ([]Account, error) {
+func (u *Upstream) adminAccounts(ctx context.Context, base, token string) ([]Account, error) {
 	resp, err := u.do(ctx, base, token, http.MethodGet, "/api/v1/admin/accounts?page=1&page_size=1000", nil)
 	if err != nil {
 		return nil, fmt.Errorf("请求 Sub2API 失败: %w", err)
@@ -129,7 +136,7 @@ type TestOutcome struct {
 
 // TestAccount 调 Sub2API 的账号测试接口（SSE），把正文拼起来。
 // prompt 为空时用 Sub2API 自己的默认提示词。
-func (u *Upstream) TestAccount(ctx context.Context, base, token string, accountID int64, model, prompt string) (*TestOutcome, error) {
+func (u *Upstream) testAdminAccount(ctx context.Context, base, token string, accountID int64, model, prompt string) (*TestOutcome, error) {
 	started := time.Now()
 	body := map[string]any{}
 	if strings.TrimSpace(model) != "" {

@@ -18,3 +18,9 @@ dist/
 .idea/
 .vscode/
 *.log
+.env
+.env.*
+!.env.example
+upstreams.json
+server/degradation-check
+server/degradation-check.exe
