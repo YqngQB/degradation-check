@@ -1,3 +1,7 @@
+# pnpm 9 (Docker/CI) requires a non-empty workspace package list.
+packages:
+  - '.'
+
 # pnpm 10/11 require explicit approval for the bundler's native binary setup.
 allowBuilds:
   esbuild: true
